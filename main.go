@@ -1,4 +1,3 @@
-// Package main implements a Kubernetes vulnerability scanner for container images with SBOMs.
 package main
 
 import (
@@ -30,34 +29,38 @@ import (
 	"github.com/anchore/grype/grype"
 	v6dist "github.com/anchore/grype/grype/db/v6/distribution"
 	v6inst "github.com/anchore/grype/grype/db/v6/installation"
+	grypedistro "github.com/anchore/grype/grype/distro"
 	"github.com/anchore/grype/grype/match"
+	"github.com/anchore/grype/grype/matcher"
+	"github.com/anchore/grype/grype/matcher/stock"
+	grypePkg "github.com/anchore/grype/grype/pkg"
 	"github.com/anchore/grype/grype/vulnerability"
-	"github.com/anchore/stereoscope/pkg/image"
+	"github.com/anchore/syft/syft/format"
+	"github.com/anchore/syft/syft/linux"
+	syftPkg "github.com/anchore/syft/syft/pkg"
 	"github.com/anchore/syft/syft/source"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
-	appName       = "wolfi-scanner"
-	appVersion    = "1.0.0"
-	sbomDir       = "/var/lib/db/sbom"
-	metricsAddr   = ":9090"
-	healthPath    = "/health"
-	metricsPath   = "/metrics"
-	testModeLimit = 1
-
-	// HTTP timeouts
+	appName          = "wolfi-scanner"
+	appVersion       = "0.0.1"
+	sbomDir          = "/var/lib/db/sbom"
+	metricsAddr      = ":9090"
+	healthPath       = "/health"
+	metricsPath      = "/metrics"
+	testModeLimit    = 1
 	httpReadTimeout  = 10 * time.Second
 	httpWriteTimeout = 10 * time.Second
 	httpIdleTimeout  = 120 * time.Second
 	shutdownTimeout  = 5 * time.Second
 )
 
-// Command-line flags.
 var (
 	daemon      = flag.Bool("daemon", false, "run as daemon with periodic scans and metrics server")
 	testMode    = flag.Bool("test", false, "test mode: only process first container")
+	onlyFixed   = flag.Bool("only-fixed", false, "only report vulnerabilities with available fixes")
 	imageFilter = flag.String("image-filter", "ghcr.io/vaskozl", "filter to match container images")
 	scanPeriod  = flag.Duration("scan-period", 6*time.Hour, "time between vulnerability scans (daemon mode only)")
 	emailTo     = flag.String("email-to", "", "email address to send reports to (if empty, prints to stdout)")
@@ -102,7 +105,7 @@ var (
 		},
 	)
 	scanErrors = prometheus.NewCounter(
-		prometheus.CounterOpts{
+	prometheus.CounterOpts{
 			Name: "scanner_errors_total",
 			Help: "Total number of failed scans",
 		},
@@ -141,13 +144,11 @@ type scanner struct {
 	logger *slog.Logger
 }
 
-// sbomData holds SBOM file contents for a container image.
 type sbomData struct {
-	files map[string]string // filename -> content
+	files map[string]string
 	image string
 }
 
-// vuln represents a found vulnerability with metadata.
 type vuln struct {
 	fixVersions []string
 	id          string
@@ -163,7 +164,7 @@ func main() {
 
 	logger := setupLogger()
 	ctx, cancel := setupSignalHandler()
-	defer cancel() // Release resources
+	defer cancel()
 
 	if err := run(ctx, logger); err != nil {
 		logger.Error("application failed", "error", err)
@@ -530,27 +531,26 @@ func (s *scanner) findVulnerabilities(ctx context.Context, sbomList []sbomData) 
 			}
 		}
 
-		for filename, content := range data.files {
-			matches, err := s.scanSBOM(content)
+		// Aggregate all packages from all SBOM files for this image
+		matches, err := s.scanAggregatedSBOMs(data)
 			if err != nil {
-				s.logger.Warn("scan failed", "image", data.image, "file", filename, "error", err)
+			s.logger.Warn("scan failed", "image", data.image, "error", err)
 				continue
 			}
 
-			for _, m := range matches.Sorted() {
-				v := s.matchToVuln(m, data.image)
-				result = append(result, v)
+		for _, m := range matches.Sorted() {
+			v := s.matchToVuln(m, data.image)
+			result = append(result, v)
 
-				// Track unique packages
-				metrics[data.image].packages[v.pkg] = true
+			// Track unique packages
+			metrics[data.image].packages[v.pkg] = true
 
-				// Track vulnerabilities by severity and fixability
-				if v.severity != "" {
-					if len(v.fixVersions) > 0 {
-						metrics[data.image].fixable[v.severity]++
-					} else {
-						metrics[data.image].unfixable[v.severity]++
-					}
+			// Track vulnerabilities by severity and fixability
+			if v.severity != "" {
+				if len(v.fixVersions) > 0 {
+					metrics[data.image].fixable[v.severity]++
+				} else {
+					metrics[data.image].unfixable[v.severity]++
 				}
 			}
 		}
@@ -572,33 +572,78 @@ func (s *scanner) findVulnerabilities(ctx context.Context, sbomList []sbomData) 
 	return result, nil
 }
 
-func (s *scanner) scanSBOM(sbomContent string) (match.Matches, error) {
-	tmpFile, err := os.CreateTemp("", "sbom-*.json")
+func (s *scanner) scanAggregatedSBOMs(data sbomData) (match.Matches, error) {
+	var packages []syftPkg.Package
+	var distro *linux.Release
+	var src *source.Description
+
+	for _, content := range data.files {
+		sbom, _, _, err := format.Decode(strings.NewReader(content))
+		if err != nil {
+			continue
+		}
+
+		if distro == nil && sbom.Artifacts.LinuxDistribution != nil {
+			distro = sbom.Artifacts.LinuxDistribution
+		}
+		if src == nil {
+			src = &sbom.Source
+		}
+
+		for _, p := range sbom.Artifacts.Packages.Sorted() {
+			if s.isMetadataArtifact(p, distro) {
+				continue
+			}
+			packages = append(packages, p)
+		}
+	}
+
+	if len(packages) == 0 {
+		return match.Matches{}, nil
+	}
+
+	var grypeDistro *grypedistro.Distro
+	if distro != nil {
+		grypeDistro = grypedistro.New(grypedistro.Type(distro.ID), distro.VersionID, "", distro.IDLike...)
+	}
+
+	grypePackages := grypePkg.FromPackages(packages, grypePkg.SynthesisConfig{
+		GenerateMissingCPEs: true,
+		Distro:              grypePkg.DistroConfig{Override: grypeDistro},
+	})
+
+	s.logger.Info("scanning packages", "image", data.image, "packages", len(grypePackages))
+
+	vulnMatcher := &grype.VulnerabilityMatcher{
+		VulnerabilityProvider: s.store,
+		Matchers: matcher.NewDefaultMatchers(matcher.Config{
+			Stock: stock.MatcherConfig{UseCPEs: true},
+		}),
+		NormalizeByCVE: true,
+	}
+
+	matches, _, err := vulnMatcher.FindMatches(grypePackages, grypePkg.Context{
+		Source: src,
+		Distro: grypeDistro,
+	})
 	if err != nil {
-		return match.Matches{}, fmt.Errorf("create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.WriteString(sbomContent); err != nil {
-		tmpFile.Close()
-		return match.Matches{}, fmt.Errorf("write temp file: %w", err)
+		return match.Matches{}, fmt.Errorf("find matches: %w", err)
 	}
 
-	if err := tmpFile.Close(); err != nil {
-		return match.Matches{}, fmt.Errorf("close temp file: %w", err)
-	}
+	return *matches, nil
+}
 
-	matches, _, _, err := grype.FindVulnerabilities(
-		s.store,
-		fmt.Sprintf("sbom:%s", tmpFile.Name()),
-		source.UnknownScope,
-		&image.RegistryOptions{},
-	)
-	if err != nil {
-		return match.Matches{}, fmt.Errorf("find vulnerabilities: %w", err)
+func (s *scanner) isMetadataArtifact(p syftPkg.Package, distro *linux.Release) bool {
+	if strings.HasSuffix(p.Name, ".yaml") || strings.HasSuffix(p.Name, ".yml") {
+		return true
 	}
-
-	return matches, nil
+	if string(p.Type) == "" || p.Type == "UnknownPackage" {
+		return true
+	}
+	if p.Name == "wolfi" || (distro != nil && p.Name == distro.Name) {
+		return true
+	}
+	return false
 }
 
 func (s *scanner) matchToVuln(m match.Match, imageName string) vuln {
@@ -622,6 +667,16 @@ func (s *scanner) matchToVuln(m match.Match, imageName string) vuln {
 }
 
 func (s *scanner) handleResults(vulns []vuln) error {
+	if *onlyFixed {
+		filtered := make([]vuln, 0, len(vulns))
+		for _, v := range vulns {
+			if len(v.fixVersions) > 0 {
+				filtered = append(filtered, v)
+			}
+		}
+		vulns = filtered
+	}
+
 	if len(vulns) == 0 {
 		s.logger.Info("no vulnerabilities found")
 		fmt.Println("No vulnerabilities found in any scanned images.")
@@ -631,7 +686,6 @@ func (s *scanner) handleResults(vulns []vuln) error {
 	report := formatReport(vulns)
 
 	if *emailTo == "" {
-		// No email configured, print to stdout
 		fmt.Print(report)
 		return nil
 	}
@@ -647,6 +701,24 @@ func (s *scanner) handleResults(vulns []vuln) error {
 func formatReport(vulns []vuln) string {
 	var sb strings.Builder
 
+	severityCounts := make(map[string]int)
+	fixableCounts := make(map[string]int)
+	for _, v := range vulns {
+		severityCounts[v.severity]++
+		if len(v.fixVersions) > 0 {
+			fixableCounts[v.severity]++
+		}
+	}
+
+	sb.WriteString("=== Vulnerability Summary ===\n")
+	sb.WriteString(fmt.Sprintf("Total: %d vulnerabilities\n", len(vulns)))
+	for _, severity := range []string{"Critical", "High", "Medium", "Low", "Negligible", "Unknown"} {
+		if count := severityCounts[severity]; count > 0 {
+			sb.WriteString(fmt.Sprintf("  %s: %d (%d fixable)\n", severity, count, fixableCounts[severity]))
+		}
+	}
+	sb.WriteString("\n=== Detailed Findings ===\n\n")
+
 	for _, v := range vulns {
 		sb.WriteString(fmt.Sprintf("%s: %s in %s affected by %s: %s\n  %s\n",
 			v.severity, v.pkg, v.image, v.id, v.dataSource, v.desc))
@@ -656,7 +728,6 @@ func formatReport(vulns []vuln) string {
 		} else {
 			sb.WriteString("  No fix available :(\n")
 		}
-
 		sb.WriteString(fmt.Sprintf("  * %s\n\n", v.image))
 	}
 
@@ -664,28 +735,18 @@ func formatReport(vulns []vuln) string {
 }
 
 func sendEmail(report string) error {
-	if *smtpServer == "" {
-		return errors.New("smtp-server is required for email delivery")
+	if *smtpServer == "" || *emailFrom == "" {
+		return errors.New("smtp-server and email-from are required")
 	}
 
-	if *emailFrom == "" {
-		return errors.New("email-from is required for email delivery")
-	}
-
-	// Build email message with proper headers
 	var msg strings.Builder
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", *emailFrom))
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", *emailTo))
+	msg.WriteString(fmt.Sprintf("From: %s\r\nTo: %s\r\n", *emailFrom, *emailTo))
 	msg.WriteString("Subject: Vulnerability Scan Report\r\n")
-	msg.WriteString("MIME-Version: 1.0\r\n")
-	msg.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	msg.WriteString("\r\n")
+	msg.WriteString("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n")
 	msg.WriteString(report)
 
-	// Setup authentication if credentials provided
 	var auth smtp.Auth
 	if *smtpUser != "" {
-		// Extract host from server address for AUTH
 		host := *smtpServer
 		if idx := strings.Index(host, ":"); idx != -1 {
 			host = host[:idx]
@@ -697,20 +758,17 @@ func sendEmail(report string) error {
 }
 
 func getK8sConfig(logger *slog.Logger) (*rest.Config, error) {
-	// Try in-cluster config first
-	config, err := rest.InClusterConfig()
-	if err == nil {
+	if config, err := rest.InClusterConfig(); err == nil {
 		logger.Info("using in-cluster kubernetes config")
 		return config, nil
 	}
 
-	// Fall back to local kubeconfig
 	kubeconfig := filepath.Join(os.Getenv("HOME"), ".kube", "config")
 	if env := os.Getenv("KUBECONFIG"); env != "" {
 		kubeconfig = env
 	}
 
-	config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
