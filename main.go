@@ -83,7 +83,7 @@ var (
 			Name: "scanner_vulnerabilities",
 			Help: "Current number of vulnerabilities per image and severity",
 		},
-		[]string{"image", "severity", "fixable"},
+		[]string{"image", "severity", "fixable", "id", "pkg"},
 	)
 	packages = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -158,6 +158,13 @@ type vuln struct {
 	severity    string
 	desc        string
 	dataSource  string
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
 }
 
 func main() {
@@ -547,17 +554,16 @@ func (s *scanner) findVulnerabilities(ctx context.Context, sbomList []sbomData) 
 	// Track metrics per image
 	type imageMetrics struct {
 		packages    map[string]bool
-		fixable     map[string]int // severity -> count
-		unfixable   map[string]int // severity -> count
 	}
 	metrics := make(map[string]*imageMetrics)
+
+	// Reset vulnerabilities metric before populating with new scan results
+	vulnerabilities.Reset()
 
 	for _, data := range sbomList {
 		if metrics[data.image] == nil {
 			metrics[data.image] = &imageMetrics{
 				packages:  make(map[string]bool),
-				fixable:   make(map[string]int),
-				unfixable: make(map[string]int),
 			}
 		}
 
@@ -575,28 +581,17 @@ func (s *scanner) findVulnerabilities(ctx context.Context, sbomList []sbomData) 
 			// Track unique packages
 			metrics[data.image].packages[v.pkg] = true
 
-			// Track vulnerabilities by severity and fixability
+			// Set individual vulnerability metric with CVE and package details
 			if v.severity != "" {
-				if len(v.fixVersions) > 0 {
-					metrics[data.image].fixable[v.severity]++
-				} else {
-					metrics[data.image].unfixable[v.severity]++
-				}
+				fixable := yesNo(len(v.fixVersions) > 0)
+				vulnerabilities.WithLabelValues(v.image, v.severity, fixable, v.id, v.pkg).Set(1)
 			}
 		}
 	}
 
-	// Record metrics per image
+	// Record package metrics per image
 	for image, m := range metrics {
 		packages.WithLabelValues(image).Set(float64(len(m.packages)))
-
-		// Record vulnerabilities by severity and fixability
-		for severity, count := range m.fixable {
-			vulnerabilities.WithLabelValues(image, severity, "yes").Set(float64(count))
-		}
-		for severity, count := range m.unfixable {
-			vulnerabilities.WithLabelValues(image, severity, "no").Set(float64(count))
-		}
 	}
 
 	return result, nil
