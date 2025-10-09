@@ -45,12 +45,13 @@ import (
 
 const (
 	appName          = "wolfi-scanner"
-	appVersion       = "0.0.1"
+	appVersion       = "0.0.2"
 	sbomDir          = "/var/lib/db/sbom"
 	metricsAddr      = ":9090"
 	healthPath       = "/health"
 	metricsPath      = "/metrics"
 	testModeLimit    = 1
+	dbUpdateInterval = 24 * time.Hour
 	httpReadTimeout  = 10 * time.Second
 	httpWriteTimeout = 10 * time.Second
 	httpIdleTimeout  = 120 * time.Second
@@ -196,12 +197,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 }
 
 func runDaemon(ctx context.Context, s *scanner) error {
-	s.logger.Info("starting daemon mode", "scan_period", *scanPeriod)
+	s.logger.Info("starting daemon mode", "scan_period", *scanPeriod, "db_update_interval", dbUpdateInterval)
 
-	// Start periodic scanning
 	go s.scanPeriodically(ctx)
+	go s.updateDBPeriodically(ctx)
 
-	// Start metrics server (blocks until shutdown)
 	return startMetricsServer(ctx, s.logger)
 }
 
@@ -259,7 +259,6 @@ func newScanner(ctx context.Context, client *kubernetes.Clientset, config *rest.
 }
 
 func (s *scanner) scanPeriodically(ctx context.Context) {
-	// Run immediately on startup
 	if err := s.scan(ctx); err != nil {
 		s.logger.Error("initial scan failed", "error", err)
 	}
@@ -275,6 +274,37 @@ func (s *scanner) scanPeriodically(ctx context.Context) {
 		case <-ticker.C:
 			if err := s.scan(ctx); err != nil {
 				s.logger.Error("periodic scan failed", "error", err)
+			}
+		}
+	}
+}
+
+func (s *scanner) updateDBPeriodically(ctx context.Context) {
+	ticker := time.NewTicker(dbUpdateInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("stopping DB updater")
+			return
+		case <-ticker.C:
+			s.logger.Info("updating vulnerability database")
+			appID := clio.Identification{Name: appName, Version: appVersion}
+			store, status, err := grype.LoadVulnerabilityDB(
+				v6dist.DefaultConfig(),
+				v6inst.DefaultConfig(appID),
+				true,
+			)
+			if err != nil {
+				s.logger.Error("failed to update vulnerability database", "error", err)
+				continue
+			}
+			s.store = store
+			if status != nil {
+				s.logger.Info("vulnerability database updated",
+					"built", status.Built,
+					"age", time.Since(status.Built).Round(time.Hour))
 			}
 		}
 	}
@@ -353,7 +383,7 @@ func (s *scanner) fetchSBOMs(ctx context.Context) ([]sbomData, error) {
 				return result, nil
 			}
 
-			s.logger.Info("extracting SBOM",
+			s.logger.Debug("extracting SBOM",
 				"image", ctr.Image,
 				"pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name),
 				"container", ctr.Name)
@@ -612,7 +642,7 @@ func (s *scanner) scanAggregatedSBOMs(data sbomData) (match.Matches, error) {
 		Distro:              grypePkg.DistroConfig{Override: grypeDistro},
 	})
 
-	s.logger.Info("scanning packages", "image", data.image, "packages", len(grypePackages))
+	s.logger.Debug("scanning packages", "image", data.image, "packages", len(grypePackages))
 
 	vulnMatcher := &grype.VulnerabilityMatcher{
 		VulnerabilityProvider: s.store,
