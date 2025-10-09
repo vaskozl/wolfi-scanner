@@ -45,7 +45,7 @@ import (
 
 const (
 	appName          = "wolfi-scanner"
-	appVersion       = "0.0.2"
+	appVersion       = "0.0.3"
 	sbomDir          = "/var/lib/db/sbom"
 	metricsAddr      = ":9090"
 	healthPath       = "/health"
