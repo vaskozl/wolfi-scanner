@@ -106,7 +106,7 @@ var (
 		},
 	)
 	scanErrors = prometheus.NewCounter(
-	prometheus.CounterOpts{
+		prometheus.CounterOpts{
 			Name: "scanner_errors_total",
 			Help: "Total number of failed scans",
 		},
@@ -553,7 +553,7 @@ func (s *scanner) findVulnerabilities(ctx context.Context, sbomList []sbomData) 
 
 	// Track metrics per image
 	type imageMetrics struct {
-		packages    map[string]bool
+		packages map[string]bool
 	}
 	metrics := make(map[string]*imageMetrics)
 
@@ -563,16 +563,16 @@ func (s *scanner) findVulnerabilities(ctx context.Context, sbomList []sbomData) 
 	for _, data := range sbomList {
 		if metrics[data.image] == nil {
 			metrics[data.image] = &imageMetrics{
-				packages:  make(map[string]bool),
+				packages: make(map[string]bool),
 			}
 		}
 
 		// Aggregate all packages from all SBOM files for this image
 		matches, err := s.scanAggregatedSBOMs(data)
-			if err != nil {
+		if err != nil {
 			s.logger.Warn("scan failed", "image", data.image, "error", err)
-				continue
-			}
+			continue
+		}
 
 		for _, m := range matches.Sorted() {
 			v := s.matchToVuln(m, data.image)
@@ -616,9 +616,6 @@ func (s *scanner) scanAggregatedSBOMs(data sbomData) (match.Matches, error) {
 		}
 
 		for _, p := range sbom.Artifacts.Packages.Sorted() {
-			if s.isMetadataArtifact(p, distro) {
-				continue
-			}
 			packages = append(packages, p)
 		}
 	}
@@ -656,19 +653,6 @@ func (s *scanner) scanAggregatedSBOMs(data sbomData) (match.Matches, error) {
 	}
 
 	return *matches, nil
-}
-
-func (s *scanner) isMetadataArtifact(p syftPkg.Package, distro *linux.Release) bool {
-	if strings.HasSuffix(p.Name, ".yaml") || strings.HasSuffix(p.Name, ".yml") {
-		return true
-	}
-	if string(p.Type) == "" || p.Type == "UnknownPackage" {
-		return true
-	}
-	if p.Name == "wolfi" || (distro != nil && p.Name == distro.Name) {
-		return true
-	}
-	return false
 }
 
 func (s *scanner) matchToVuln(m match.Match, imageName string) vuln {
