@@ -1,93 +1,125 @@
-# scanner
+# wolfi-scanner
 
+In-cluster vulnerability scanner for container images that ship Wolfi/Chainguard SBOMs.
 
+It connects to the Kubernetes API, extracts SBOM files from running containers (`/var/lib/db/sbom`), and scans them with [Grype](https://github.com/anchore/grype).
 
-## Getting started
+## Features
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.sko.ai/vasko/scanner.git
-git branch -M main
-git push -uf origin main
-```
-
-## Integrate with your tools
-
-- [ ] [Set up project integrations](https://gitlab.sko.ai/vasko/scanner/-/settings/integrations)
-
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+- Scans running pods for SBOM-based vulnerability data
+- Filters images by configurable prefixes (default: `cgr.dev/`)
+- Automatically filters spurious CPE matches (e.g. broad NVD CPEs like `gitlab:gitlab` matching `gitlab-runner`) while keeping legitimate ones (e.g. `redis:redis` matching `redis`)
+- Tabular CLI output grouped by image
+- Prometheus metrics for alerting and dashboards
+- Daemon mode with periodic scans and DB updates
 
 ## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+You can run this tool both interactively and in cluster. When in cluster it exposes `/metrics`.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```bash
+% go run main.go -image-filter ghcr.io/vaskozl
+time=2026-02-18T23:08:22.499Z level=INFO msg="using kubeconfig" path=/Users/vasko/.kube/config
+time=2026-02-18T23:08:22.499Z level=INFO msg="loading vulnerability database"
+time=2026-02-18T23:08:23.493Z level=INFO msg="database loaded" built=2026-02-18T14:37:10.000Z age=9h0m0s
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+ghcr.io/vaskozl/redis:8.6.0@sha256:530d8f29aa3b7b343623ee030b17c35fa7e9920e33216cef4dd1ae881e597143 (1 Low)
+────────────────────────────────────────────────────────────────────────────────
+SEVERITY  PACKAGE  INSTALLED  VULNERABILITY   FIX
+Low       redis    8.6.0-r0   CVE-2025-49112  -
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+ghcr.io/vaskozl/sonarr:4.0.16@sha256:e84d53f89f4774dc62c2632300d31a3b40ff64e9c19b4f82825729ddf256830e (3 High, 1 Medium)
+────────────────────────────────────────────────────────────────────────────────
+SEVERITY  PACKAGE  INSTALLED   VULNERABILITY        FIX
+High      glibc    2.42-r4     CVE-2025-15281       2.42-r7
+Medium    busybox  1.37.0-r50  CVE-2025-60876       1.37.0-r52
+High      glibc    2.42-r4     CVE-2026-0861        2.42-r6
+High      glibc    2.42-r4     CVE-2026-0915        2.42-r6
+Unknown   busybox  1.37.0-r50  GHSA-48hw-cv6f-mcpj  1.37.0-r52
+Unknown   glibc    2.42-r4     GHSA-5pf6-63v3-88hw  2.42-r6
+Unknown   glibc    2.42-r4     GHSA-qg56-4cfq-w9w3  2.42-r7
+Unknown   glibc    2.42-r4     GHSA-xp56-6525-9chf  2.42-r6
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+### Flags
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-daemon` | `false` | Run as daemon with periodic scans and metrics server |
+| `-debug` | `false` | Enable debug logging and dump extracted SBOMs |
+| `-test` | `false` | Only scan the first matching container |
+| `-only-fixed` | `false` | Only report vulnerabilities with available fixes |
+| `-image-filter` | `cgr.dev/` | Comma-separated list of image prefixes to match |
+| `-scan-period` | `6h` | Time between scans (daemon mode) |
 
-## License
-For open source projects, say how it is licensed.
+### Examples
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+One-shot scan of all `cgr.dev/` images in the cluster:
+
+```
+wolfi-scanner
+```
+
+Scan a specific image prefix:
+
+```
+wolfi-scanner -image-filter "ghcr.io/myorg/"
+```
+
+Multiple prefixes:
+
+```
+wolfi-scanner -image-filter "cgr.dev/,ghcr.io/myorg/"
+```
+
+Daemon mode (serves Prometheus metrics on `:9090`):
+
+```
+wolfi-scanner -daemon -scan-period 1h
+```
+
+### Output
+
+Logs go to stderr, the vulnerability report goes to stdout:
+
+```
+ghcr.io/example/app (1 High, 1 Low)
+────────────────────────────────────────────────────────────────────────────────
+SEVERITY  PACKAGE  VULNERABILITY   FIX
+High      git-lfs  CVE-2025-26625  3.7.1
+Low       redis    CVE-2025-49112  -
+```
+
+## Prometheus Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `scanner_vulnerabilities` | Gauge | `image`, `severity`, `fixable`, `id`, `pkg` | Current vulnerabilities per image |
+| `scanner_packages` | Gauge | `image` | Package count per image |
+| `scanner_duration_seconds` | Histogram | | Scan duration |
+| `scanner_scans_total` | Counter | | Total scans performed |
+| `scanner_errors_total` | Counter | | Total failed scans |
+| `scanner_images_scanned` | Gauge | | Images scanned in last run |
+| `scanner_last_scan_timestamp_seconds` | Gauge | | Unix timestamp of last scan |
+
+## Alerting
+
+See [`examples/vmrule-alerts.yaml`](examples/vmrule-alerts.yaml) for a VictoriaMetrics VMRule that fires alerts on:
+
+- **ContainerCriticalVulns** -- Critical/High severity with a fix available (fires after 1d)
+- **ContainerMediumVulnsFixAvailable** -- Medium severity with a fix available (fires after 7d)
+- **ContainerTooManyVulns** -- More than 20 total vulnerabilities in one image (fires after 1d)
+
+The alerts use the `scanner_vulnerabilities` gauge labels to include the CVE ID, package name, and image in the alert annotations.
+
+Apply with:
+
+```
+kubectl apply -f examples/vmrule-alerts.yaml
+```
+
+## Building
+
+```
+go build -o wolfi-scanner .
+```

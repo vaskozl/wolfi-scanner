@@ -9,12 +9,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/smtp"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -32,7 +33,6 @@ import (
 	grypedistro "github.com/anchore/grype/grype/distro"
 	"github.com/anchore/grype/grype/match"
 	"github.com/anchore/grype/grype/matcher"
-	"github.com/anchore/grype/grype/matcher/stock"
 	grypePkg "github.com/anchore/grype/grype/pkg"
 	"github.com/anchore/grype/grype/vulnerability"
 	"github.com/anchore/syft/syft/format"
@@ -45,322 +45,262 @@ import (
 
 const (
 	appName          = "wolfi-scanner"
-	appVersion       = "0.0.3"
+	appVersion       = "0.0.4"
 	sbomDir          = "/var/lib/db/sbom"
 	metricsAddr      = ":9090"
-	healthPath       = "/health"
-	metricsPath      = "/metrics"
-	testModeLimit    = 1
 	dbUpdateInterval = 24 * time.Hour
 	httpReadTimeout  = 10 * time.Second
 	httpWriteTimeout = 10 * time.Second
 	httpIdleTimeout  = 120 * time.Second
 	shutdownTimeout  = 5 * time.Second
+	maxSBOMFileSize  = 50 << 20 // 50 MiB
 )
 
 var (
 	daemon      = flag.Bool("daemon", false, "run as daemon with periodic scans and metrics server")
-	testMode    = flag.Bool("test", false, "test mode: only process first container")
+	debug       = flag.Bool("debug", false, "enable debug logging and dump extracted SBOMs")
+	testMode    = flag.Bool("test", false, "only scan the first matching container")
 	onlyFixed   = flag.Bool("only-fixed", false, "only report vulnerabilities with available fixes")
-	imageFilter = flag.String("image-filter", "ghcr.io/vaskozl", "filter to match container images")
-	scanPeriod  = flag.Duration("scan-period", 6*time.Hour, "time between vulnerability scans (daemon mode only)")
-	emailTo     = flag.String("email-to", "", "email address to send reports to (if empty, prints to stdout)")
-	emailFrom   = flag.String("email-from", "", "email address to send reports from")
-	smtpServer  = flag.String("smtp-server", "", "SMTP server address (e.g., smtp.gmail.com:587)")
-	smtpUser    = flag.String("smtp-user", "", "SMTP authentication username (optional)")
-	smtpPass    = flag.String("smtp-password", "", "SMTP authentication password (optional)")
+	imageFilter = flag.String("image-filter", "cgr.dev/", "comma-separated list of image prefixes to match")
+	scanPeriod  = flag.Duration("scan-period", 6*time.Hour, "time between scans (daemon mode)")
 )
 
-// Errors
-var (
-	ErrNoSBOMFiles = errors.New("no SBOM files found")
-)
+var errNoSBOM = errors.New("no SBOM files found")
 
 // Prometheus metrics
 var (
-	vulnerabilities = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "scanner_vulnerabilities",
-			Help: "Current number of vulnerabilities per image and severity",
-		},
-		[]string{"image", "severity", "fixable", "id", "pkg"},
-	)
-	packages = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "scanner_packages",
-			Help: "Number of packages per container image",
-		},
-		[]string{"image"},
-	)
-	scanDuration = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "scanner_duration_seconds",
-			Help:    "Duration of vulnerability scans",
-			Buckets: []float64{1, 5, 10, 30, 60, 120, 300},
-		},
-	)
-	scansTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "scanner_scans_total",
-			Help: "Total number of vulnerability scans performed",
-		},
-	)
-	scanErrors = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "scanner_errors_total",
-			Help: "Total number of failed scans",
-		},
-	)
-	imagesScanned = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "scanner_images_scanned",
-			Help: "Number of images scanned in last run",
-		},
-	)
-	lastScanTime = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "scanner_last_scan_timestamp_seconds",
-			Help: "Unix timestamp of last completed scan",
-		},
-	)
+	vulnGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "scanner_vulnerabilities",
+		Help: "Current vulnerabilities per image and severity",
+	}, []string{"image", "severity", "fixable", "id", "pkg"})
+	pkgGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "scanner_packages",
+		Help: "Package count per image",
+	}, []string{"image"})
+	scanDuration  = prometheus.NewHistogram(prometheus.HistogramOpts{Name: "scanner_duration_seconds", Help: "Scan duration", Buckets: []float64{1, 5, 10, 30, 60, 120, 300}})
+	scansTotal    = prometheus.NewCounter(prometheus.CounterOpts{Name: "scanner_scans_total", Help: "Total scans"})
+	scanErrors    = prometheus.NewCounter(prometheus.CounterOpts{Name: "scanner_errors_total", Help: "Failed scans"})
+	imagesScanned = prometheus.NewGauge(prometheus.GaugeOpts{Name: "scanner_images_scanned", Help: "Images scanned in last run"})
+	lastScanTime  = prometheus.NewGauge(prometheus.GaugeOpts{Name: "scanner_last_scan_timestamp_seconds", Help: "Last scan unix timestamp"})
 )
 
 func init() {
-	prometheus.MustRegister(
-		vulnerabilities,
-		packages,
-		scanDuration,
-		scansTotal,
-		scanErrors,
-		imagesScanned,
-		lastScanTime,
-	)
+	prometheus.MustRegister(vulnGauge, pkgGauge, scanDuration, scansTotal, scanErrors, imagesScanned, lastScanTime)
 }
 
-// scanner manages the vulnerability scanning process.
 type scanner struct {
+	mu     sync.RWMutex
 	store  vulnerability.Provider
 	client *kubernetes.Clientset
 	config *rest.Config
 	logger *slog.Logger
 }
 
-type sbomData struct {
-	files map[string]string
-	image string
-}
-
 type vuln struct {
-	fixVersions []string
 	id          string
 	pkg         string
+	version     string
 	image       string
 	severity    string
-	desc        string
-	dataSource  string
+	fixVersions []string
 }
 
-func yesNo(b bool) string {
-	if b {
-		return "yes"
+func (v vuln) fix() string {
+	if len(v.fixVersions) > 0 {
+		return strings.Join(v.fixVersions, ", ")
 	}
-	return "no"
+	return "-"
 }
+
+// --- main ---
 
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Printf("%s %s\n", appName, appVersion)
+		return
+	}
+
 	logger := setupLogger()
-	ctx, cancel := setupSignalHandler()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	if err := run(ctx, logger); err != nil {
-		logger.Error("application failed", "error", err)
+		logger.Error(err.Error())
 		os.Exit(1)
 	}
+}
+
+func setupLogger() *slog.Logger {
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
 	config, err := getK8sConfig(logger)
 	if err != nil {
-		return fmt.Errorf("get kubernetes config: %w", err)
+		return err
 	}
-
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("create kubernetes client: %w", err)
 	}
-
-	scanner, err := newScanner(ctx, client, config, logger)
+	s, err := newScanner(client, config, logger)
 	if err != nil {
-		return fmt.Errorf("create scanner: %w", err)
+		return err
 	}
-
 	if *daemon {
-		return runDaemon(ctx, scanner)
+		return s.runDaemon(ctx)
 	}
-
-	return runOnce(ctx, scanner)
-}
-
-func runDaemon(ctx context.Context, s *scanner) error {
-	s.logger.Info("starting daemon mode", "scan_period", *scanPeriod, "db_update_interval", dbUpdateInterval)
-
-	go s.scanPeriodically(ctx)
-	go s.updateDBPeriodically(ctx)
-
-	return startMetricsServer(ctx, s.logger)
-}
-
-func runOnce(ctx context.Context, s *scanner) error {
-	s.logger.Info("starting one-time scan")
 	return s.scan(ctx)
 }
 
-func setupLogger() *slog.Logger {
-	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})
-	logger := slog.New(handler)
-	slog.SetDefault(logger)
-	return logger
-}
+// --- scanner lifecycle ---
 
-func setupSignalHandler() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
-}
-
-func newScanner(ctx context.Context, client *kubernetes.Clientset, config *rest.Config, logger *slog.Logger) (*scanner, error) {
-	logger.Info("loading vulnerability database")
-
-	appID := clio.Identification{
-		Name:    appName,
-		Version: appVersion,
+func newScanner(client *kubernetes.Clientset, config *rest.Config, logger *slog.Logger) (*scanner, error) {
+	store, err := loadDB(logger)
+	if err != nil {
+		return nil, err
 	}
+	return &scanner{client: client, config: config, store: store, logger: logger}, nil
+}
 
-	store, status, err := grype.LoadVulnerabilityDB(
-		v6dist.DefaultConfig(),
-		v6inst.DefaultConfig(appID),
-		true, // check for updates
-	)
+func loadDB(logger *slog.Logger) (vulnerability.Provider, error) {
+	logger.Info("loading vulnerability database")
+	id := clio.Identification{Name: appName, Version: appVersion}
+	store, status, err := grype.LoadVulnerabilityDB(v6dist.DefaultConfig(), v6inst.DefaultConfig(id), true)
 	if err != nil {
 		return nil, fmt.Errorf("load vulnerability database: %w", err)
 	}
-
 	if status != nil {
-		logger.Info("vulnerability database loaded",
-			"built", status.Built,
-			"age", time.Since(status.Built).Round(time.Hour))
+		logger.Info("database loaded", "built", status.Built, "age", time.Since(status.Built).Round(time.Hour))
 	}
-
-	return &scanner{
-		client: client,
-		config: config,
-		store:  store,
-		logger: logger,
-	}, nil
+	return store, nil
 }
 
-func (s *scanner) scanPeriodically(ctx context.Context) {
-	if err := s.scan(ctx); err != nil {
-		s.logger.Error("initial scan failed", "error", err)
-	}
+func (s *scanner) getStore() vulnerability.Provider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.store
+}
 
+func (s *scanner) setStore(st vulnerability.Provider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store = st
+}
+
+func (s *scanner) runDaemon(ctx context.Context) error {
+	s.logger.Info("starting daemon", "scan_period", *scanPeriod)
+	go s.scanLoop(ctx)
+	go s.dbUpdateLoop(ctx)
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "OK") })
+	srv := &http.Server{
+		Addr: metricsAddr, Handler: mux,
+		ReadTimeout: httpReadTimeout, WriteTimeout: httpWriteTimeout, IdleTimeout: httpIdleTimeout,
+	}
+	go func() {
+		<-ctx.Done()
+		c, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		srv.Shutdown(c)
+	}()
+	s.logger.Info("metrics server listening", "addr", metricsAddr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("metrics server: %w", err)
+	}
+	return nil
+}
+
+func (s *scanner) scanLoop(ctx context.Context) {
+	if err := s.scan(ctx); err != nil {
+		s.logger.Error("scan failed", "error", err)
+	}
 	ticker := time.NewTicker(*scanPeriod)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("stopping periodic scanner")
 			return
 		case <-ticker.C:
 			if err := s.scan(ctx); err != nil {
-				s.logger.Error("periodic scan failed", "error", err)
+				s.logger.Error("scan failed", "error", err)
 			}
 		}
 	}
 }
 
-func (s *scanner) updateDBPeriodically(ctx context.Context) {
+func (s *scanner) dbUpdateLoop(ctx context.Context) {
 	ticker := time.NewTicker(dbUpdateInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("stopping DB updater")
 			return
 		case <-ticker.C:
 			s.logger.Info("updating vulnerability database")
-			appID := clio.Identification{Name: appName, Version: appVersion}
-			store, status, err := grype.LoadVulnerabilityDB(
-				v6dist.DefaultConfig(),
-				v6inst.DefaultConfig(appID),
-				true,
-			)
+			st, err := loadDB(s.logger)
 			if err != nil {
-				s.logger.Error("failed to update vulnerability database", "error", err)
+				s.logger.Error("db update failed", "error", err)
 				continue
 			}
-			s.store = store
-			if status != nil {
-				s.logger.Info("vulnerability database updated",
-					"built", status.Built,
-					"age", time.Since(status.Built).Round(time.Hour))
-			}
+			s.setStore(st)
 		}
 	}
 }
 
-func (s *scanner) scan(ctx context.Context) error {
-	s.logger.Info("starting vulnerability scan")
-	start := time.Now()
+// --- scan ---
 
-	sbomList, err := s.fetchSBOMs(ctx)
-	if err != nil {
+func (s *scanner) scan(ctx context.Context) error {
+	start := time.Now()
+	ok := false
+	defer func() {
 		scanDuration.Observe(time.Since(start).Seconds())
-		scanErrors.Inc()
+		if !ok {
+			scanErrors.Inc()
+		}
+	}()
+
+	sboms, err := s.fetchSBOMs(ctx)
+	if err != nil {
 		return fmt.Errorf("fetch SBOMs: %w", err)
 	}
-
-	if len(sbomList) == 0 {
-		s.logger.Info("no images found to scan")
-		scanDuration.Observe(time.Since(start).Seconds())
-		scansTotal.Inc()
-		lastScanTime.SetToCurrentTime()
+	if len(sboms) == 0 {
+		s.logger.Info("no matching images found")
+		ok = true
 		return nil
 	}
 
-	vulns, err := s.findVulnerabilities(ctx, sbomList)
-	if err != nil {
-		scanDuration.Observe(time.Since(start).Seconds())
-		scanErrors.Inc()
-		return fmt.Errorf("find vulnerabilities: %w", err)
-	}
+	all := s.findVulns(sboms)
+	reported := filterVulns(all)
+	recordMetrics(reported)
+	fmt.Print(formatReport(reported))
 
-	if err := s.handleResults(vulns); err != nil {
-		scanDuration.Observe(time.Since(start).Seconds())
-		scanErrors.Inc()
-		return fmt.Errorf("handle results: %w", err)
-	}
-
-	// Record successful scan metrics
-	scanDuration.Observe(time.Since(start).Seconds())
+	ok = true
 	scansTotal.Inc()
-	imagesScanned.Set(float64(len(sbomList)))
+	imagesScanned.Set(float64(len(sboms)))
 	lastScanTime.SetToCurrentTime()
-
 	s.logger.Info("scan completed",
 		"duration", time.Since(start).Round(time.Second),
-		"images_scanned", len(sbomList),
-		"vulnerabilities", len(vulns))
-
+		"images", len(sboms),
+		"total", len(all),
+		"reported", len(reported))
 	return nil
+}
+
+// --- SBOM fetching ---
+
+type sbomData struct {
+	image string
+	files map[string]string
 }
 
 func (s *scanner) fetchSBOMs(ctx context.Context) ([]sbomData, error) {
@@ -371,234 +311,167 @@ func (s *scanner) fetchSBOMs(ctx context.Context) ([]sbomData, error) {
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
 
+	filters := parseFilters(*imageFilter)
 	var result []sbomData
 	seen := make(map[string]bool)
-	processed := 0
 
 	for _, pod := range pods.Items {
 		for _, ctr := range pod.Spec.Containers {
-			if !strings.Contains(ctr.Image, *imageFilter) {
+			if !matchesAny(ctr.Image, filters) || seen[ctr.Image] {
 				continue
 			}
-
-			if seen[ctr.Image] {
-				continue
-			}
-
-			if *testMode && processed >= testModeLimit {
-				s.logger.Info("test mode limit reached", "limit", testModeLimit)
+			if *testMode && len(result) >= 1 {
 				return result, nil
 			}
 
-			s.logger.Debug("extracting SBOM",
-				"image", ctr.Image,
-				"pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name),
-				"container", ctr.Name)
-
+			s.logger.Debug("extracting SBOM", "image", ctr.Image, "pod", pod.Namespace+"/"+pod.Name)
 			data, err := s.extractSBOM(ctx, pod.Namespace, pod.Name, ctr.Name, ctr.Image)
 			if err != nil {
-				if errors.Is(err, ErrNoSBOMFiles) {
-					s.logger.Warn("no SBOM files in container", "image", ctr.Image)
-				} else {
-					s.logger.Warn("failed to extract SBOM", "image", ctr.Image, "error", err)
+				if !errors.Is(err, errNoSBOM) {
+					s.logger.Warn("SBOM extraction failed", "image", ctr.Image, "error", err)
 				}
 				continue
 			}
 
+			if *debug {
+				for name, content := range data.files {
+					fmt.Fprintf(os.Stderr, "--- SBOM: %s (image: %s) ---\n%s\n", name, data.image, content)
+				}
+			}
+
 			result = append(result, *data)
 			seen[ctr.Image] = true
-			processed++
 		}
 	}
-
 	return result, nil
 }
 
-func (s *scanner) extractSBOM(ctx context.Context, namespace, podName, containerName, image string) (*sbomData, error) {
-	// Check if SBOM directory exists and has files
-	checkCmd := []string{"sh", "-c", fmt.Sprintf("[ -d %s ] && [ -n \"$(ls -A %s 2>/dev/null)\" ] && echo ok || echo empty", sbomDir, sbomDir)}
-	output, err := s.execInPod(ctx, namespace, podName, containerName, checkCmd)
-	if err != nil {
-		return nil, fmt.Errorf("check SBOM directory: %w", err)
+func parseFilters(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if f := strings.TrimSpace(p); f != "" {
+			out = append(out, f)
+		}
 	}
-
-	if strings.TrimSpace(output) != "ok" {
-		return nil, ErrNoSBOMFiles
-	}
-
-	// Use tar to stream all files at once (like kubectl cp)
-	files, err := s.copyFilesFromPod(ctx, namespace, podName, containerName, sbomDir)
-	if err != nil {
-		return nil, fmt.Errorf("copy SBOM files: %w", err)
-	}
-
-	if len(files) == 0 {
-		return nil, ErrNoSBOMFiles
-	}
-
-	return &sbomData{
-		image: image,
-		files: files,
-	}, nil
+	return out
 }
 
-// copyFilesFromPod copies all files from a directory in a pod using tar streaming.
-// This is much more efficient than running cat for each file individually.
-func (s *scanner) copyFilesFromPod(ctx context.Context, namespace, podName, containerName, srcPath string) (map[string]string, error) {
-	// Create tar command to archive the directory
-	cmd := []string{"tar", "cf", "-", "-C", srcPath, "."}
+func matchesAny(image string, filters []string) bool {
+	for _, f := range filters {
+		if strings.Contains(image, f) {
+			return true
+		}
+	}
+	return false
+}
 
-	req := s.client.CoreV1().
-		RESTClient().
-		Post().
-		Resource("pods").
-		Name(podName).
-		Namespace(namespace).
-		SubResource("exec").
-		Param("container", containerName).
-		VersionedParams(&corev1.PodExecOptions{
-			Command: cmd,
-			Stdin:   false,
-			Stdout:  true,
-			Stderr:  true,
-			TTY:     false,
-		}, scheme.ParameterCodec)
-
-	executor, err := remotecommand.NewSPDYExecutor(s.config, "POST", req.URL())
+func (s *scanner) extractSBOM(ctx context.Context, ns, pod, container, image string) (*sbomData, error) {
+	cmd := []string{"sh", "-c", fmt.Sprintf("[ -d %s ] && [ -n \"$(ls -A %s 2>/dev/null)\" ] && echo ok || echo empty", sbomDir, sbomDir)}
+	out, err := s.execInPod(ctx, ns, pod, container, cmd)
 	if err != nil {
-		return nil, fmt.Errorf("create executor: %w", err)
+		return nil, fmt.Errorf("check SBOM dir: %w", err)
+	}
+	if strings.TrimSpace(out) != "ok" {
+		return nil, errNoSBOM
 	}
 
-	// Capture stdout (tar stream) and stderr
-	reader, writer := io.Pipe()
-	var stderr strings.Builder
+	files, err := s.copyFromPod(ctx, ns, pod, container, sbomDir)
+	if err != nil {
+		return nil, fmt.Errorf("copy SBOMs: %w", err)
+	}
+	if len(files) == 0 {
+		return nil, errNoSBOM
+	}
+	return &sbomData{image: image, files: files}, nil
+}
 
+func (s *scanner) copyFromPod(ctx context.Context, ns, pod, container, srcPath string) (map[string]string, error) {
+	req := s.client.CoreV1().RESTClient().Post().
+		Resource("pods").Name(pod).Namespace(ns).SubResource("exec").
+		Param("container", container).
+		VersionedParams(&corev1.PodExecOptions{
+			Command: []string{"tar", "cf", "-", "-C", srcPath, "."},
+			Stdout:  true, Stderr: true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(s.config, "POST", req.URL())
+	if err != nil {
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
 	go func() {
-		defer writer.Close()
-		if err := executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-			Stdout: writer,
-			Stderr: &stderr,
-		}); err != nil && !errors.Is(err, context.Canceled) {
-			s.logger.Debug("tar stream error", "error", err, "stderr", stderr.String())
-		}
+		defer pw.Close()
+		exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: pw, Stderr: io.Discard})
 	}()
 
-	// Extract files from tar stream
 	files := make(map[string]string)
-	tarReader := tar.NewReader(reader)
-
+	tr := tar.NewReader(pr)
 	for {
-		header, err := tarReader.Next()
+		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read tar header: %w", err)
+			return nil, fmt.Errorf("read tar: %w", err)
 		}
-
-		// Skip directories
-		if header.Typeflag == tar.TypeDir {
+		if hdr.Typeflag == tar.TypeDir {
 			continue
 		}
-
-		// Read file content
-		content, err := io.ReadAll(tarReader)
+		content, err := io.ReadAll(io.LimitReader(tr, maxSBOMFileSize+1))
 		if err != nil {
-			s.logger.Warn("failed to read file from tar", "file", header.Name, "error", err)
+			s.logger.Warn("failed to read tar entry", "file", hdr.Name, "error", err)
 			continue
 		}
-
-		files[header.Name] = string(content)
+		if int64(len(content)) > maxSBOMFileSize {
+			s.logger.Warn("SBOM too large, skipping", "file", hdr.Name)
+			continue
+		}
+		files[hdr.Name] = string(content)
 	}
-
 	return files, nil
 }
 
-func (s *scanner) execInPod(ctx context.Context, namespace, podName, containerName string, cmd []string) (string, error) {
-	req := s.client.CoreV1().
-		RESTClient().
-		Post().
-		Resource("pods").
-		Name(podName).
-		Namespace(namespace).
-		SubResource("exec").
-		Param("container", containerName).
+func (s *scanner) execInPod(ctx context.Context, ns, pod, container string, cmd []string) (string, error) {
+	req := s.client.CoreV1().RESTClient().Post().
+		Resource("pods").Name(pod).Namespace(ns).SubResource("exec").
+		Param("container", container).
 		VersionedParams(&corev1.PodExecOptions{
-			Command: cmd,
-			Stdin:   false,
-			Stdout:  true,
-			Stderr:  true,
-			TTY:     false,
+			Command: cmd, Stdout: true, Stderr: true,
 		}, scheme.ParameterCodec)
 
-	executor, err := remotecommand.NewSPDYExecutor(s.config, "POST", req.URL())
+	exec, err := remotecommand.NewSPDYExecutor(s.config, "POST", req.URL())
 	if err != nil {
-		return "", fmt.Errorf("create executor: %w", err)
+		return "", err
 	}
-
 	var stdout, stderr strings.Builder
-	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-	})
-	if err != nil {
-		return "", fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+	if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout, Stderr: &stderr,
+	}); err != nil {
+		return "", fmt.Errorf("exec: %w (stderr: %s)", err, stderr.String())
 	}
-
 	return stdout.String(), nil
 }
 
-func (s *scanner) findVulnerabilities(ctx context.Context, sbomList []sbomData) ([]vuln, error) {
+// --- vulnerability scanning ---
+
+func (s *scanner) findVulns(sboms []sbomData) []vuln {
 	var result []vuln
-
-	// Track metrics per image
-	type imageMetrics struct {
-		packages map[string]bool
-	}
-	metrics := make(map[string]*imageMetrics)
-
-	// Reset vulnerabilities metric before populating with new scan results
-	vulnerabilities.Reset()
-
-	for _, data := range sbomList {
-		if metrics[data.image] == nil {
-			metrics[data.image] = &imageMetrics{
-				packages: make(map[string]bool),
-			}
-		}
-
-		// Aggregate all packages from all SBOM files for this image
-		matches, err := s.scanAggregatedSBOMs(data)
+	for _, data := range sboms {
+		matches, err := s.matchVulns(data)
 		if err != nil {
 			s.logger.Warn("scan failed", "image", data.image, "error", err)
 			continue
 		}
-
 		for _, m := range matches.Sorted() {
-			v := s.matchToVuln(m, data.image)
-			result = append(result, v)
-
-			// Track unique packages
-			metrics[data.image].packages[v.pkg] = true
-
-			// Set individual vulnerability metric with CVE and package details
-			if v.severity != "" {
-				fixable := yesNo(len(v.fixVersions) > 0)
-				vulnerabilities.WithLabelValues(v.image, v.severity, fixable, v.id, v.pkg).Set(1)
-			}
+			result = append(result, toVuln(m, data.image))
 		}
 	}
-
-	// Record package metrics per image
-	for image, m := range metrics {
-		packages.WithLabelValues(image).Set(float64(len(m.packages)))
-	}
-
-	return result, nil
+	return result
 }
 
-func (s *scanner) scanAggregatedSBOMs(data sbomData) (match.Matches, error) {
-	var packages []syftPkg.Package
+func (s *scanner) matchVulns(data sbomData) (match.Matches, error) {
+	var pkgs []syftPkg.Package
 	var distro *linux.Release
 	var src *source.Description
 
@@ -607,218 +480,205 @@ func (s *scanner) scanAggregatedSBOMs(data sbomData) (match.Matches, error) {
 		if err != nil {
 			continue
 		}
-
 		if distro == nil && sbom.Artifacts.LinuxDistribution != nil {
 			distro = sbom.Artifacts.LinuxDistribution
 		}
 		if src == nil {
 			src = &sbom.Source
 		}
-
+		// Only include APK packages. Per-package SBOMs also contain source
+		// entries (Go modules, GitHub refs, etc.) that cause false positives
+		// when scanned independently of the full image catalog.
 		for _, p := range sbom.Artifacts.Packages.Sorted() {
-			packages = append(packages, p)
+			if p.Type == syftPkg.ApkPkg {
+				pkgs = append(pkgs, p)
+			}
 		}
 	}
-
-	if len(packages) == 0 {
+	if len(pkgs) == 0 {
 		return match.Matches{}, nil
 	}
 
-	var grypeDistro *grypedistro.Distro
+	var gd *grypedistro.Distro
 	if distro != nil {
-		grypeDistro = grypedistro.New(grypedistro.Type(distro.ID), distro.VersionID, "", distro.IDLike...)
+		gd = grypedistro.New(grypedistro.Type(distro.ID), distro.VersionID, "", distro.IDLike...)
 	}
 
-	grypePackages := grypePkg.FromPackages(packages, grypePkg.SynthesisConfig{
+	grypePkgs := grypePkg.FromPackages(pkgs, grypePkg.SynthesisConfig{
 		GenerateMissingCPEs: true,
-		Distro:              grypePkg.DistroConfig{Override: grypeDistro},
+		Distro:              grypePkg.DistroConfig{Override: gd},
 	})
+	s.logger.Debug("scanning", "image", data.image, "packages", len(grypePkgs))
 
-	s.logger.Debug("scanning packages", "image", data.image, "packages", len(grypePackages))
-
-	vulnMatcher := &grype.VulnerabilityMatcher{
-		VulnerabilityProvider: s.store,
-		Matchers: matcher.NewDefaultMatchers(matcher.Config{
-			Stock: stock.MatcherConfig{UseCPEs: true},
-		}),
-		NormalizeByCVE: true,
+	vm := &grype.VulnerabilityMatcher{
+		VulnerabilityProvider: s.getStore(),
+		Matchers:              matcher.NewDefaultMatchers(matcher.Config{}),
+		NormalizeByCVE:        true,
 	}
-
-	matches, _, err := vulnMatcher.FindMatches(grypePackages, grypePkg.Context{
-		Source: src,
-		Distro: grypeDistro,
-	})
+	matches, _, err := vm.FindMatches(grypePkgs, grypePkg.Context{Source: src, Distro: gd})
 	if err != nil {
 		return match.Matches{}, fmt.Errorf("find matches: %w", err)
 	}
 
-	return *matches, nil
+	// The APK matcher always performs CPE matching internally. When scanning
+	// per-package SBOMs (rather than an image directly), this produces false
+	// positives from overly broad NVD CPEs (e.g. "gitlab" matching "gitlab-runner").
+	// Filter out CPE-only matches where no CPE product matches the package name.
+	var kept []match.Match
+	for _, m := range matches.Sorted() {
+		if !isSpuriousCPEMatch(m) {
+			kept = append(kept, m)
+		}
+	}
+	return match.NewMatches(kept...), nil
 }
 
-func (s *scanner) matchToVuln(m match.Match, imageName string) vuln {
-	v := vuln{
-		id:    m.Vulnerability.ID,
-		pkg:   m.Package.Name,
-		image: imageName,
-	}
-
+func toVuln(m match.Match, image string) vuln {
+	v := vuln{id: m.Vulnerability.ID, pkg: m.Package.Name, version: m.Package.Version, image: image}
 	if m.Vulnerability.Metadata != nil {
 		v.severity = m.Vulnerability.Metadata.Severity
-		v.desc = m.Vulnerability.Metadata.Description
-		v.dataSource = m.Vulnerability.Metadata.DataSource
 	}
-
 	if m.Vulnerability.Fix.State == "fixed" {
 		v.fixVersions = m.Vulnerability.Fix.Versions
 	}
-
 	return v
 }
 
-func (s *scanner) handleResults(vulns []vuln) error {
-	if *onlyFixed {
-		filtered := make([]vuln, 0, len(vulns))
-		for _, v := range vulns {
-			if len(v.fixVersions) > 0 {
-				filtered = append(filtered, v)
+// isSpuriousCPEMatch returns true when a match came exclusively via CPE and
+// none of the matched CPE products match the package name. This filters broad
+// NVD CPEs (e.g. "gitlab" matching "gitlab-runner") while keeping legitimate
+// ones (e.g. "redis" matching "redis").
+func isSpuriousCPEMatch(m match.Match) bool {
+	for _, d := range m.Details {
+		if d.Type != match.CPEMatch {
+			return false
+		}
+	}
+	if len(m.Details) == 0 {
+		return false
+	}
+	pkgName := m.Package.Name
+	for _, d := range m.Details {
+		result, ok := d.Found.(match.CPEResult)
+		if !ok {
+			continue
+		}
+		for _, cpe := range result.CPEs {
+			// cpe:2.3:part:vendor:product:version:...
+			if parts := strings.SplitN(cpe, ":", 6); len(parts) >= 5 && parts[4] == pkgName {
+				return false
 			}
 		}
-		vulns = filtered
 	}
-
-	if len(vulns) == 0 {
-		s.logger.Info("no vulnerabilities found")
-		fmt.Println("No vulnerabilities found in any scanned images.")
-		return nil
-	}
-
-	report := formatReport(vulns)
-
-	if *emailTo == "" {
-		fmt.Print(report)
-		return nil
-	}
-
-	if err := sendEmail(report); err != nil {
-		return fmt.Errorf("send email: %w", err)
-	}
-
-	s.logger.Info("email sent", "to", *emailTo)
-	return nil
+	return true
 }
 
+// --- filtering ---
+
+func filterVulns(vulns []vuln) []vuln {
+	if !*onlyFixed {
+		return vulns
+	}
+	out := make([]vuln, 0, len(vulns))
+	for _, v := range vulns {
+		if len(v.fixVersions) > 0 {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// --- output ---
+
 func formatReport(vulns []vuln) string {
+	if len(vulns) == 0 {
+		return "No vulnerabilities found.\n"
+	}
+
 	var sb strings.Builder
 
-	severityCounts := make(map[string]int)
-	fixableCounts := make(map[string]int)
+	type group struct {
+		image string
+		vulns []vuln
+	}
+	var order []string
+	groups := make(map[string]*group)
 	for _, v := range vulns {
-		severityCounts[v.severity]++
-		if len(v.fixVersions) > 0 {
-			fixableCounts[v.severity]++
+		g, ok := groups[v.image]
+		if !ok {
+			order = append(order, v.image)
+			g = &group{image: v.image}
+			groups[v.image] = g
 		}
+		g.vulns = append(g.vulns, v)
 	}
 
-	sb.WriteString("=== Vulnerability Summary ===\n")
-	sb.WriteString(fmt.Sprintf("Total: %d vulnerabilities\n", len(vulns)))
-	for _, severity := range []string{"Critical", "High", "Medium", "Low", "Negligible", "Unknown"} {
-		if count := severityCounts[severity]; count > 0 {
-			sb.WriteString(fmt.Sprintf("  %s: %d (%d fixable)\n", severity, count, fixableCounts[severity]))
+	for _, image := range order {
+		g := groups[image]
+
+		counts := make(map[string]int)
+		for _, v := range g.vulns {
+			counts[v.severity]++
 		}
-	}
-	sb.WriteString("\n=== Detailed Findings ===\n\n")
-
-	for _, v := range vulns {
-		sb.WriteString(fmt.Sprintf("%s: %s in %s affected by %s: %s\n  %s\n",
-			v.severity, v.pkg, v.image, v.id, v.dataSource, v.desc))
-
-		if len(v.fixVersions) > 0 {
-			sb.WriteString("  Update to: " + strings.Join(v.fixVersions, ", ") + "\n")
-		} else {
-			sb.WriteString("  No fix available :(\n")
+		var parts []string
+		for _, sev := range []string{"Critical", "High", "Medium", "Low"} {
+			if n := counts[sev]; n > 0 {
+				parts = append(parts, fmt.Sprintf("%d %s", n, sev))
+			}
 		}
-		sb.WriteString(fmt.Sprintf("  * %s\n\n", v.image))
-	}
 
+		sb.WriteString(fmt.Sprintf("\n%s (%s)\n", image, strings.Join(parts, ", ")))
+		sb.WriteString(strings.Repeat("─", 80) + "\n")
+
+		tw := tabwriter.NewWriter(&sb, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(tw, "SEVERITY\tPACKAGE\tINSTALLED\tVULNERABILITY\tFIX\n")
+		for _, v := range g.vulns {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", v.severity, v.pkg, v.version, v.id, v.fix())
+		}
+		tw.Flush()
+	}
+	sb.WriteString("\n")
 	return sb.String()
 }
 
-func sendEmail(report string) error {
-	if *smtpServer == "" || *emailFrom == "" {
-		return errors.New("smtp-server and email-from are required")
-	}
+// --- metrics ---
 
-	var msg strings.Builder
-	msg.WriteString(fmt.Sprintf("From: %s\r\nTo: %s\r\n", *emailFrom, *emailTo))
-	msg.WriteString("Subject: Vulnerability Scan Report\r\n")
-	msg.WriteString("MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n")
-	msg.WriteString(report)
-
-	var auth smtp.Auth
-	if *smtpUser != "" {
-		host := *smtpServer
-		if idx := strings.Index(host, ":"); idx != -1 {
-			host = host[:idx]
+func recordMetrics(vulns []vuln) {
+	vulnGauge.Reset()
+	pkgsByImage := make(map[string]map[string]bool)
+	for _, v := range vulns {
+		if pkgsByImage[v.image] == nil {
+			pkgsByImage[v.image] = make(map[string]bool)
 		}
-		auth = smtp.PlainAuth("", *smtpUser, *smtpPass, host)
+		pkgsByImage[v.image][v.pkg] = true
+		if v.severity != "" {
+			fixable := "no"
+			if len(v.fixVersions) > 0 {
+				fixable = "yes"
+			}
+			vulnGauge.WithLabelValues(v.image, v.severity, fixable, v.id, v.pkg).Set(1)
+		}
 	}
-
-	return smtp.SendMail(*smtpServer, auth, *emailFrom, []string{*emailTo}, []byte(msg.String()))
+	for image, pkgs := range pkgsByImage {
+		pkgGauge.WithLabelValues(image).Set(float64(len(pkgs)))
+	}
 }
 
-func getK8sConfig(logger *slog.Logger) (*rest.Config, error) {
-	if config, err := rest.InClusterConfig(); err == nil {
-		logger.Info("using in-cluster kubernetes config")
-		return config, nil
-	}
+// --- kubernetes config ---
 
+func getK8sConfig(logger *slog.Logger) (*rest.Config, error) {
+	if c, err := rest.InClusterConfig(); err == nil {
+		logger.Info("using in-cluster config")
+		return c, nil
+	}
 	kubeconfig := filepath.Join(os.Getenv("HOME"), ".kube", "config")
 	if env := os.Getenv("KUBECONFIG"); env != "" {
 		kubeconfig = env
 	}
-
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	c, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
-
-	logger.Info("using local kubeconfig", "path", kubeconfig)
-	return config, nil
-}
-
-func startMetricsServer(ctx context.Context, logger *slog.Logger) error {
-	mux := http.NewServeMux()
-	mux.Handle(metricsPath, promhttp.Handler())
-	mux.HandleFunc(healthPath, handleHealth)
-
-	server := &http.Server{
-		Addr:         metricsAddr,
-		Handler:      mux,
-		ReadTimeout:  httpReadTimeout,
-		WriteTimeout: httpWriteTimeout,
-		IdleTimeout:  httpIdleTimeout,
-	}
-
-	// Graceful shutdown
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Error("metrics server shutdown failed", "error", err)
-		}
-	}()
-
-	logger.Info("starting metrics server", "addr", metricsAddr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("metrics server failed: %w", err)
-	}
-
-	return nil
-}
-
-func handleHealth(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "OK")
+	logger.Info("using kubeconfig", "path", kubeconfig)
+	return c, nil
 }
