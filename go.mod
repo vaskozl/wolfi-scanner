@@ -4,7 +4,7 @@ go 1.25.1
 
 require (
 	github.com/anchore/clio v0.0.0-20260217161816-1b390cf973f8
-	github.com/anchore/grype v0.108.0
+	github.com/anchore/grype v0.109.0
 	github.com/anchore/syft v1.42.1
 	github.com/prometheus/client_golang v1.23.2
 	k8s.io/api v0.35.1
